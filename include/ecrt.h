@@ -870,6 +870,12 @@ EC_PUBLIC_API int ecrt_master_get_slave(
                                       information */
         );
 
+EC_PUBLIC_API int ecrt_master_set_slave_state(
+        ec_master_t *master, /**< EtherCAT master */
+        uint16_t slave_position, /**< Slave position. */
+        ec_al_state_t al_state /**< Application-layer state. */
+        );
+
 #ifndef __KERNEL__
 
 /** Returns the proposed configuration of a slave's sync manager.
