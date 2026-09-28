@@ -282,6 +282,16 @@ int ecrt_master_get_slave(
     return 0;
 }
 
+int ecrt_master_set_slave_state(
+        ec_master_t *master,     /**< EtherCAT master */
+        uint16_t slave_position, /**< Slave position. */
+        ec_al_state_t al_state   /**< Application-layer state. */
+)
+{
+    // There is no bus: every fake slave already reports EC_AL_STATE_OP.
+    return 0;
+}
+
 int ecrt_master_get_sync_manager(
         ec_master_t *master,     /**< EtherCAT master. */
         uint16_t slave_position, /**< Slave position. */
