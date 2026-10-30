@@ -112,6 +112,12 @@
  */
 #define EC_EXT_RING_SIZE 32
 
+/** Number of slaves configured at the same time.
+ *
+ * Each adds one mailbox-sized datagram to a cycle while it is configured.
+ */
+#define EC_MAX_PARALLEL_CONFIGS 8
+
 /** Maximum number of masters.
  */
 #define EC_MAX_MASTERS 32
@@ -223,6 +229,10 @@ struct ec_master {
                                       for the FSM side. */
     unsigned int injection_seq_rt; /**< Datagram injection sequence number
                                      for the realtime side. */
+    unsigned int inject_fsm_datagram; /**< The injection includes \a
+                                        fsm_datagram. */
+    ec_slave_configurator_t configurators[EC_MAX_PARALLEL_CONFIGS]; /**<
+                                    Slots for slaves configured in parallel. */
 
     ec_slave_t *slaves; /**< Array of slaves on the bus. */
     unsigned int slave_count; /**< Number of slaves on the bus. */

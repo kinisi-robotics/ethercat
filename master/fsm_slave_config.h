@@ -78,4 +78,35 @@ int ec_fsm_slave_config_success(const ec_fsm_slave_config_t *);
 
 /****************************************************************************/
 
+/** Everything one slave's configuration needs of its own, so that slaves can
+ * be configured in parallel.
+ *
+ * The master owns a fixed pool of these for its whole lifetime, so the
+ * datagram outlives any slave: a slot is lent to a slave for one configuration
+ * and only reused once its datagram is back. In OPERATION phase the datagram
+ * is queued by ecrt_master_send() under \a injection_seq_fsm.
+ */
+struct ec_slave_configurator
+{
+    ec_slave_t *slave; /**< Slave being configured, or NULL if free. */
+    ec_datagram_t datagram; /**< Datagram of this slave's configuration. */
+    ec_fsm_change_t fsm_change; /**< State change state machine. */
+    ec_fsm_coe_t fsm_coe; /**< CoE state machine. */
+    ec_fsm_soe_t fsm_soe; /**< SoE state machine. */
+    ec_fsm_pdo_t fsm_pdo; /**< PDO configuration state machine. */
+    ec_fsm_eoe_t fsm_eoe; /**< EoE state machine. */
+    ec_fsm_slave_config_t fsm; /**< Slave configuration state machine. */
+    unsigned int inject; /**< \a datagram is to be sent. */
+};
+
+typedef struct ec_slave_configurator ec_slave_configurator_t;
+
+int ec_slave_configurator_init(ec_slave_configurator_t *);
+void ec_slave_configurator_clear(ec_slave_configurator_t *);
+int ec_slave_configurator_is_free(const ec_slave_configurator_t *);
+void ec_slave_configurator_start(ec_slave_configurator_t *, ec_slave_t *);
+void ec_slave_configurator_detach(ec_slave_configurator_t *);
+
+/****************************************************************************/
+
 #endif

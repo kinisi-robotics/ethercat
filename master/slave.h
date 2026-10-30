@@ -225,6 +225,8 @@ struct ec_slave
     struct list_head eoe_requests; /**< EoE set IP parameter requests. */
 
     ec_fsm_slave_t fsm; /**< Slave state machine. */
+    struct ec_slave_configurator *configurator; /**< Non-NULL while the slave
+                                                  is being configured. */
 };
 
 /****************************************************************************/

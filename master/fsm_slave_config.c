@@ -155,6 +155,105 @@ void ec_fsm_slave_config_clear(
 
 /****************************************************************************/
 
+/** Constructor.
+ *
+ * \return Zero on success, otherwise a negative error code.
+ */
+int ec_slave_configurator_init(
+        ec_slave_configurator_t *c /**< Configurator. */
+        )
+{
+    int ret;
+
+    c->slave = NULL;
+    ec_datagram_init(&c->datagram);
+    snprintf(c->datagram.name, EC_DATAGRAM_NAME_SIZE, "slave-config");
+    ret = ec_datagram_prealloc(&c->datagram, EC_MAX_DATA_SIZE);
+    if (ret) {
+        ec_datagram_clear(&c->datagram);
+        return ret;
+    }
+
+    ec_fsm_coe_init(&c->fsm_coe);
+    ec_fsm_soe_init(&c->fsm_soe);
+    ec_fsm_pdo_init(&c->fsm_pdo, &c->fsm_coe);
+#ifdef EC_EOE
+    ec_fsm_eoe_init(&c->fsm_eoe);
+#endif
+    ec_fsm_change_init(&c->fsm_change, &c->datagram);
+    ec_fsm_slave_config_init(&c->fsm, &c->datagram, &c->fsm_change,
+            &c->fsm_coe, &c->fsm_soe, &c->fsm_pdo, &c->fsm_eoe);
+    c->inject = 0;
+    return 0;
+}
+
+/****************************************************************************/
+
+/** Destructor. Only once no datagram can be queued any more.
+ */
+void ec_slave_configurator_clear(
+        ec_slave_configurator_t *c /**< Configurator. */
+        )
+{
+    ec_fsm_slave_config_clear(&c->fsm);
+    ec_fsm_change_clear(&c->fsm_change);
+#ifdef EC_EOE
+    ec_fsm_eoe_clear(&c->fsm_eoe);
+#endif
+    ec_fsm_pdo_clear(&c->fsm_pdo);
+    ec_fsm_soe_clear(&c->fsm_soe);
+    ec_fsm_coe_clear(&c->fsm_coe);
+    ec_datagram_clear(&c->datagram);
+}
+
+/****************************************************************************/
+
+/**
+ * \return Non-zero, if the configurator can be lent to a slave: unlent and
+ * its datagram no longer in the queue.
+ */
+int ec_slave_configurator_is_free(
+        const ec_slave_configurator_t *c /**< Configurator. */
+        )
+{
+    ec_datagram_state_t state = smp_load_acquire(&c->datagram.state);
+
+    return !c->slave && state != EC_DATAGRAM_QUEUED
+        && state != EC_DATAGRAM_SENT;
+}
+
+/****************************************************************************/
+
+/** Lends a free configurator to \a slave and starts configuring it.
+ */
+void ec_slave_configurator_start(
+        ec_slave_configurator_t *c, /**< Free configurator. */
+        ec_slave_t *slave /**< Slave to configure. */
+        )
+{
+    c->slave = slave;
+    c->inject = 0;
+    c->datagram.device_index = slave->device_index;
+    ec_fsm_slave_config_start(&c->fsm, slave);
+    slave->configurator = c;
+}
+
+/****************************************************************************/
+
+/** Takes the configurator back from its slave. Its datagram may still be in
+ * the queue; is_free() waits for it.
+ */
+void ec_slave_configurator_detach(
+        ec_slave_configurator_t *c /**< Lent configurator. */
+        )
+{
+    c->slave->configurator = NULL;
+    c->slave = NULL;
+    c->inject = 0;
+}
+
+/****************************************************************************/
+
 /** Start slave configuration state machine.
  */
 void ec_fsm_slave_config_start(

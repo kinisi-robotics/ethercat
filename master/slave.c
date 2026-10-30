@@ -35,6 +35,7 @@
 #include "slave_config.h"
 
 #include "slave.h"
+#include "fsm_slave_config.h"
 
 /****************************************************************************/
 
@@ -157,6 +158,7 @@ void ec_slave_init(
 
     // create state machine object
     ec_fsm_slave_init(&slave->fsm, slave);
+    slave->configurator = NULL;
 }
 
 /****************************************************************************/
@@ -256,6 +258,10 @@ void ec_slave_clear(ec_slave_t *slave /**< EtherCAT slave */)
     }
 
     ec_fsm_slave_clear(&slave->fsm);
+
+    if (slave->configurator) {
+        ec_slave_configurator_detach(slave->configurator);
+    }
 }
 
 /****************************************************************************/

@@ -61,7 +61,6 @@ void ec_fsm_master_state_start(ec_fsm_master_t *);
 void ec_fsm_master_state_broadcast(ec_fsm_master_t *);
 void ec_fsm_master_state_read_state(ec_fsm_master_t *);
 void ec_fsm_master_state_acknowledge(ec_fsm_master_t *);
-void ec_fsm_master_state_configure_slave(ec_fsm_master_t *);
 void ec_fsm_master_state_clear_addresses(ec_fsm_master_t *);
 void ec_fsm_master_state_dc_measure_delays(ec_fsm_master_t *);
 void ec_fsm_master_state_scan_slave(ec_fsm_master_t *);
@@ -432,7 +431,7 @@ void ec_fsm_master_state_broadcast(
 
     if (master->slave_count) {
         // application applied configurations
-        if (master->config_changed) {
+        if (master->config_changed && !master->config_busy) {
             master->config_changed = 0;
 
             EC_MASTER_DBG(master, 1, "Configuration changed.\n");
@@ -610,6 +609,12 @@ void ec_fsm_master_action_idle(
     ec_master_t *master = fsm->master;
     ec_slave_t *slave;
 
+    // mailbox and SII work waits until no slave is being configured
+    if (master->config_busy) {
+        ec_fsm_master_restart(fsm);
+        return;
+    }
+
     // Check for pending internal SDO or SoE requests
     if (ec_fsm_master_action_process_int_request(fsm)) {
         return;
@@ -696,8 +701,10 @@ void ec_fsm_master_action_configure(
 {
     ec_master_t *master = fsm->master;
     ec_slave_t *slave = fsm->slave;
+    unsigned int i;
 
-    if (master->config_changed) {
+    // DC system times are only rewritten while no slave is being configured
+    if (master->config_changed && !master->config_busy) {
         master->config_changed = 0;
 
         // abort iterating through slaves,
@@ -713,10 +720,23 @@ void ec_fsm_master_action_configure(
 
     // Does the slave have to be configured?
     if ((slave->current_state != slave->requested_state
-                || slave->force_config) && !slave->error_flag) {
-        // Start slave configuration
+                || slave->force_config) && !slave->error_flag
+            && !master->config_changed) {
+
+        for (i = 0; i < EC_MAX_PARALLEL_CONFIGS; i++) {
+            if (ec_slave_configurator_is_free(&master->configurators[i])) {
+                break;
+            }
+        }
+        if (i == EC_MAX_PARALLEL_CONFIGS) {
+            // all slots busy; picked up again on a later pass
+            ec_fsm_master_action_next_slave_state(fsm);
+            return;
+        }
+        ec_slave_configurator_start(&master->configurators[i], slave);
+
         down(&master->config_sem);
-        master->config_busy = 1;
+        master->config_busy++;
         up(&master->config_sem);
 
         if (master->debug_level) {
@@ -729,12 +749,7 @@ void ec_fsm_master_action_configure(
                     slave->force_config ? " (forced)" : "");
         }
 
-        fsm->idle = 0;
-        fsm->state = ec_fsm_master_state_configure_slave;
-        ec_fsm_slave_config_start(&fsm->fsm_slave_config, slave);
-        fsm->state(fsm); // execute immediately
-        fsm->datagram->device_index = fsm->slave->device_index;
-        return;
+        // runs in ec_master_exec_slave_configs(), alongside the others
     }
 
     // process next slave
@@ -755,6 +770,12 @@ void ec_fsm_master_state_read_state(
     ec_datagram_t *datagram = fsm->datagram;
 
     if (datagram->state == EC_DATAGRAM_TIMED_OUT && fsm->retries--) {
+        return;
+    }
+
+    if (slave->configurator) {
+        // its configuration tracks and acknowledges the AL state itself
+        ec_fsm_master_action_next_slave_state(fsm);
         return;
     }
 
@@ -1006,36 +1027,6 @@ void ec_fsm_master_state_scan_slave(
     } else {
         ec_fsm_master_restart(fsm);
     }
-}
-
-/****************************************************************************/
-
-/** Master state: CONFIGURE SLAVE.
- *
- * Starts configuring a slave.
- */
-void ec_fsm_master_state_configure_slave(
-        ec_fsm_master_t *fsm /**< Master state machine. */
-        )
-{
-    ec_master_t *master = fsm->master;
-
-    if (ec_fsm_slave_config_exec(&fsm->fsm_slave_config)) {
-        return;
-    }
-
-    fsm->slave->force_config = 0;
-
-    // configuration finished
-    master->config_busy = 0;
-    wake_up_interruptible(&master->config_queue);
-
-    if (!ec_fsm_slave_config_success(&fsm->fsm_slave_config)) {
-        // TODO(fp): mark slave_config as failed.
-    }
-
-    fsm->idle = 1;
-    ec_fsm_master_action_next_slave_state(fsm);
 }
 
 /****************************************************************************/

@@ -116,6 +116,8 @@ void ec_master_thread_stop(ec_master_t *);
 void ec_master_inject_external_datagrams(ec_master_t *);
 ec_datagram_t *ec_master_get_external_datagram(ec_master_t *);
 void ec_master_exec_slave_fsms(ec_master_t *);
+int ec_master_exec_slave_configs(ec_master_t *);
+void ec_master_queue_slave_configs(ec_master_t *);
 void ec_master_send_datagrams(ec_master_t *, ec_device_index_t);
 int ec_master_calc_topology_rec(ec_master_t *, ec_slave_t *, unsigned int *);
 void ec_master_calc_topology(ec_master_t *);
@@ -200,6 +202,7 @@ int ec_master_init(ec_master_t *master, /**< EtherCAT master */
 
     master->injection_seq_fsm = 0;
     master->injection_seq_rt = 0;
+    master->inject_fsm_datagram = 0;
 
     master->slaves = NULL;
     master->slave_count = 0;
@@ -287,6 +290,18 @@ int ec_master_init(ec_master_t *master, /**< EtherCAT master */
         ec_datagram_clear(&master->fsm_datagram);
         EC_MASTER_ERR(master, "Failed to allocate FSM datagram.\n");
         goto out_clear_devices;
+    }
+
+    for (i = 0; i < EC_MAX_PARALLEL_CONFIGS; i++) {
+        ret = ec_slave_configurator_init(&master->configurators[i]);
+        if (ret) {
+            EC_MASTER_ERR(master, "Failed to allocate slave configurators.\n");
+            for (; i > 0; i--) {
+                ec_slave_configurator_clear(&master->configurators[i - 1]);
+            }
+            ec_datagram_clear(&master->fsm_datagram);
+            goto out_clear_devices;
+        }
     }
 
     // create state machine object
@@ -385,6 +400,9 @@ out_clear_ext_datagrams:
         ec_datagram_clear(&master->ext_datagram_ring[i]);
     }
     ec_fsm_master_clear(&master->fsm);
+    for (i = 0; i < EC_MAX_PARALLEL_CONFIGS; i++) {
+        ec_slave_configurator_clear(&master->configurators[i]);
+    }
     ec_datagram_clear(&master->fsm_datagram);
 out_clear_devices:
     for (; dev_idx > 0; dev_idx--) {
@@ -430,6 +448,9 @@ void ec_master_clear(
     }
 
     ec_fsm_master_clear(&master->fsm);
+    for (i = 0; i < EC_MAX_PARALLEL_CONFIGS; i++) {
+        ec_slave_configurator_clear(&master->configurators[i]);
+    }
     ec_datagram_clear(&master->fsm_datagram);
 
     for (dev_idx = EC_DEVICE_MAIN; dev_idx < ec_master_num_devices(master);
@@ -515,6 +536,12 @@ void ec_master_clear_slaves(ec_master_t *master)
     }
 
     master->slave_count = 0;
+
+    // ec_slave_clear() dropped every running configuration
+    down(&master->config_sem);
+    master->config_busy = 0;
+    up(&master->config_sem);
+    wake_up_interruptible(&master->config_queue);
 }
 
 /****************************************************************************/
@@ -1526,6 +1553,74 @@ void ec_master_exec_slave_fsms(
 
 /****************************************************************************/
 
+/** Executes the slave configurations started by the master FSM.
+ *
+ * Returns each configurator to the pool once its configuration has finished.
+ *
+ * \return Non-zero, if a configuration datagram is to be sent.
+ */
+int ec_master_exec_slave_configs(
+        ec_master_t *master /**< EtherCAT master. */
+        )
+{
+    unsigned int i;
+    int inject = 0;
+
+    for (i = 0; i < EC_MAX_PARALLEL_CONFIGS; i++) {
+        ec_slave_configurator_t *c = &master->configurators[i];
+        ec_slave_t *slave = c->slave;
+        ec_datagram_state_t state;
+
+        if (!slave || c->inject) {
+            continue;
+        }
+        state = smp_load_acquire(&c->datagram.state);
+        if (state == EC_DATAGRAM_QUEUED || state == EC_DATAGRAM_SENT) {
+            continue;
+        }
+
+        if (ec_fsm_slave_config_exec(&c->fsm)) {
+            c->inject = 1;
+            inject = 1;
+            continue;
+        }
+
+        slave->force_config = 0;
+        ec_slave_configurator_detach(c);
+
+        down(&master->config_sem);
+        master->config_busy--;
+        up(&master->config_sem);
+        wake_up_interruptible(&master->config_queue);
+    }
+
+    return inject;
+}
+
+/****************************************************************************/
+
+/** Queues the datagrams of the slave configurations that produced one.
+ *
+ * Touches only the master's configurator pool, never a slave.
+ */
+void ec_master_queue_slave_configs(
+        ec_master_t *master /**< EtherCAT master. */
+        )
+{
+    unsigned int i;
+
+    for (i = 0; i < EC_MAX_PARALLEL_CONFIGS; i++) {
+        ec_slave_configurator_t *c = &master->configurators[i];
+
+        if (c->inject) {
+            ec_master_queue_datagram(master, &c->datagram);
+            c->inject = 0;
+        }
+    }
+}
+
+/****************************************************************************/
+
 /** Master kernel thread function for IDLE phase.
  */
 static int ec_master_idle_thread(void *priv_data)
@@ -1558,6 +1653,7 @@ static int ec_master_idle_thread(void *priv_data)
         }
 
         fsm_exec = ec_fsm_master_exec(&master->fsm);
+        ec_master_exec_slave_configs(master);
 
         ec_master_exec_slave_fsms(master);
 
@@ -1569,6 +1665,8 @@ static int ec_master_idle_thread(void *priv_data)
         if (fsm_exec) {
             ec_master_queue_datagram(master, &master->fsm_datagram);
         }
+        // also picks up any injection the OPERATION phase left unsent
+        ec_master_queue_slave_configs(master);
         ecrt_master_send(master);
 #ifdef EC_USE_HRTIMER
         sent_bytes = master->devices[EC_DEVICE_MAIN].tx_skb[
@@ -1576,7 +1674,7 @@ static int ec_master_idle_thread(void *priv_data)
 #endif
         rt_mutex_unlock(&master->io_mutex);
 
-        if (ec_fsm_master_idle(&master->fsm)) {
+        if (ec_fsm_master_idle(&master->fsm) && !master->config_busy) {
 #ifdef EC_USE_HRTIMER
             ec_master_nanosleep(master->send_interval * 1000);
 #else
@@ -1625,7 +1723,9 @@ static int ec_master_operation_thread(void *priv_data)
                 break;
             }
 
-            if (ec_fsm_master_exec(&master->fsm)) {
+            master->inject_fsm_datagram = ec_fsm_master_exec(&master->fsm);
+            if (ec_master_exec_slave_configs(master)
+                    || master->inject_fsm_datagram) {
                 // Inject datagrams (let the RT thread queue them, see
                 // ecrt_master_send())
                 // re-ordering-safe version of `master->injection_seq_fsm++`
@@ -1642,7 +1742,7 @@ static int ec_master_operation_thread(void *priv_data)
         // the op thread should not work faster than the sending RT thread
         ec_master_nanosleep(master->send_interval * 1000);
 #else
-        if (ec_fsm_master_idle(&master->fsm)) {
+        if (ec_fsm_master_idle(&master->fsm) && !master->config_busy) {
             set_current_state(TASK_INTERRUPTIBLE);
             schedule_timeout(1);
         }
@@ -2344,6 +2444,7 @@ int ecrt_master_activate(ec_master_t *master)
 
     master->injection_seq_fsm = 0;
     master->injection_seq_rt = 0;
+    master->inject_fsm_datagram = 0;
 
     master->send_cb = master->app_send_cb;
     master->receive_cb = master->app_receive_cb;
@@ -2452,8 +2553,11 @@ int ecrt_master_send(ec_master_t *master)
 
     seq_fsm = smp_load_acquire(&master->injection_seq_fsm);
     if (master->injection_seq_rt != seq_fsm) {
-        // inject datagram produced by master FSM
-        ec_master_queue_datagram(master, &master->fsm_datagram);
+        // inject datagrams produced by master FSM and slave configurations
+        if (master->inject_fsm_datagram) {
+            ec_master_queue_datagram(master, &master->fsm_datagram);
+        }
+        ec_master_queue_slave_configs(master);
 
         smp_store_release(&master->injection_seq_rt, seq_fsm);
     }
