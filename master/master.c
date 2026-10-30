@@ -1104,6 +1104,7 @@ void ec_master_send_datagrams(
             datagram->cycles_sent = cycles_sent;
 #endif
             datagram->jiffies_sent = jiffies_sent;
+            datagram->app_time_sent = master->app_time;
             list_del_init(&datagram->sent); // remove from sent queue
             smp_store_release(&datagram->state, EC_DATAGRAM_SENT);
         }
