@@ -62,6 +62,7 @@ struct ec_fsm_slave_config
     unsigned long jiffies_start; /**< For timeout calculations. */
     unsigned int take_time; /**< Store jiffies after datagram reception. */
     unsigned long wait_ms; /**< Wait time (used to wait before SAFEOP). */
+    unsigned int dc_stepped; /**< System time offset already corrected. */
 };
 
 /****************************************************************************/

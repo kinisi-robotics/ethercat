@@ -80,6 +80,7 @@ void ec_fsm_slave_config_state_pdo_conf(ec_fsm_slave_config_t *);
 void ec_fsm_slave_config_state_fmmu(ec_fsm_slave_config_t *);
 void ec_fsm_slave_config_state_dc_cycle(ec_fsm_slave_config_t *);
 void ec_fsm_slave_config_state_dc_sync_check(ec_fsm_slave_config_t *);
+void ec_fsm_slave_config_state_dc_step(ec_fsm_slave_config_t *);
 void ec_fsm_slave_config_state_dc_start(ec_fsm_slave_config_t *);
 void ec_fsm_slave_config_state_dc_assign(ec_fsm_slave_config_t *);
 void ec_fsm_slave_config_state_wait_safeop(ec_fsm_slave_config_t *);
@@ -1525,7 +1526,9 @@ void ec_fsm_slave_config_state_dc_cycle(
     EC_SLAVE_DBG(slave, 1, "Checking for synchrony.\n");
 
     fsm->jiffies_start = jiffies;
-    ec_datagram_fprd(datagram, slave->station_address, 0x092c, 4);
+    fsm->dc_stepped = 0;
+    // offset (0x0920) and difference (0x092C) in one read, so they match
+    ec_datagram_fprd(datagram, slave->station_address, 0x0920, 16);
     fsm->retries = EC_FSM_RETRIES;
     fsm->state = ec_fsm_slave_config_state_dc_sync_check;
 }
@@ -1542,7 +1545,7 @@ void ec_fsm_slave_config_state_dc_sync_check(
     ec_slave_t *slave = fsm->slave;
     ec_master_t *master = slave->master;
     ec_slave_config_t *config = slave->config;
-    uint32_t abs_sync_diff;
+    uint32_t sync_diff, abs_sync_diff;
     unsigned long diff_ms;
     ec_sync_signal_t *sync0 = &config->dc_sync[0];
     ec_sync_signal_t *sync1 = &config->dc_sync[1];
@@ -1571,19 +1574,43 @@ void ec_fsm_slave_config_state_dc_sync_check(
         return;
     }
 
-    abs_sync_diff = EC_READ_U32(datagram->data) & 0x7fffffff;
+    sync_diff = EC_READ_U32(datagram->data + 12);
+    abs_sync_diff = sync_diff & 0x7fffffff;
     diff_ms = (datagram->jiffies_received - fsm->jiffies_start) * 1000 / HZ;
 
     if (abs_sync_diff > EC_DC_MAX_SYNC_DIFF_NS) {
         if (diff_ms >= EC_DC_SYNC_WAIT_MS) {
             EC_SLAVE_WARN(slave, "Slave did not sync after %lu ms.\n",
                     diff_ms);
+        } else if (!fsm->dc_stepped) {
+            // Step the offset by the measured difference instead of waiting
+            // for the slave's time loop to slew it away. Sign found on a
+            // ZeroErr drive: bit 31 set means the local copy is ahead.
+            u64 old_offset = EC_READ_U64(datagram->data);
+            u64 new_offset = sync_diff & 0x80000000
+                ? old_offset - abs_sync_diff : old_offset + abs_sync_diff;
+
+            if (slave->base_dc_range == EC_DC_32) {
+                new_offset = (old_offset & 0xffffffff00000000ULL)
+                    | (new_offset & 0xffffffffULL);
+            }
+
+            EC_SLAVE_DBG(slave, 1, "Stepping DC offset by %s%u ns"
+                    " after %lu ms.\n", sync_diff & 0x80000000 ? "-" : "+",
+                    abs_sync_diff, diff_ms);
+
+            fsm->dc_stepped = 1;
+            ec_datagram_fpwr(datagram, slave->station_address, 0x0920, 8);
+            EC_WRITE_U64(datagram->data, new_offset);
+            fsm->retries = EC_FSM_RETRIES;
+            fsm->state = ec_fsm_slave_config_state_dc_step;
+            return;
         } else {
             EC_SLAVE_DBG(slave, 1, "Sync after %4lu ms: %10u ns\n",
                     diff_ms, abs_sync_diff);
 
             // check synchrony again
-            ec_datagram_fprd(datagram, slave->station_address, 0x092c, 4);
+            ec_datagram_fprd(datagram, slave->station_address, 0x0920, 16);
             fsm->retries = EC_FSM_RETRIES;
             return;
         }
@@ -1628,6 +1655,45 @@ void ec_fsm_slave_config_state_dc_sync_check(
     EC_WRITE_U64(datagram->data, start_time);
     fsm->retries = EC_FSM_RETRIES;
     fsm->state = ec_fsm_slave_config_state_dc_start;
+}
+
+/****************************************************************************/
+
+/** Slave configuration state: DC STEP.
+ */
+void ec_fsm_slave_config_state_dc_step(
+        ec_fsm_slave_config_t *fsm /**< slave state machine */
+        )
+{
+    ec_datagram_t *datagram = fsm->datagram;
+    ec_slave_t *slave = fsm->slave;
+
+    if (!slave->config) { // config removed in the meantime
+        ec_fsm_slave_config_reconfigure(fsm);
+        return;
+    }
+
+    if (datagram->state == EC_DATAGRAM_TIMED_OUT && fsm->retries--)
+        return;
+
+    if (datagram->state != EC_DATAGRAM_RECEIVED) {
+        fsm->state = ec_fsm_slave_config_state_error;
+        EC_SLAVE_ERR(slave, "Failed to receive DC offset step datagram: ");
+        ec_datagram_print_state(datagram);
+        return;
+    }
+
+    if (datagram->working_counter != 1) {
+        slave->error_flag = 1;
+        fsm->state = ec_fsm_slave_config_state_error;
+        EC_SLAVE_ERR(slave, "Failed to step DC offset: ");
+        ec_datagram_print_wc_error(datagram);
+        return;
+    }
+
+    ec_datagram_fprd(datagram, slave->station_address, 0x0920, 16);
+    fsm->retries = EC_FSM_RETRIES;
+    fsm->state = ec_fsm_slave_config_state_dc_sync_check;
 }
 
 /****************************************************************************/
